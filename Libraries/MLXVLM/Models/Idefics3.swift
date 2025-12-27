@@ -886,61 +886,93 @@ public class Idefics3Processor: UserInputProcessor {
         self.globalImageTagId = Self.lookupTokenId(tokenizer: tokenizer, token: "<global-img>")
     }
 
-    /// Split an image into tiles of maxImageSize, plus a global view
-    /// Returns (tiles, numRows, numCols) where tiles includes all patches + global at the end
-    private func splitImage(_ image: CIImage) -> ([CIImage], Int, Int) {
-        let width = Int(image.extent.width)
-        let height = Int(image.extent.height)
+    /// Resize image to fit within longestEdge, then pad to make dimensions multiples of tileSize.
+    /// This preserves aspect ratio exactly by adding black padding instead of stretching.
+    private func resizeAndPadForTiling(_ image: CIImage, longestEdge: Int, tileSize: Int) -> CIImage {
+        // Step 1: Resize to fit within longestEdge, preserving aspect ratio exactly
+        let fitSize = MediaProcessing.bestFit(
+            image.extent.size,
+            in: CGSize(width: longestEdge, height: longestEdge)
+        )
+        let resizedImage = MediaProcessing.resampleBicubic(image, to: fitSize)
 
-        // Calculate number of splits needed
-        let numRows = (height + maxImageSize - 1) / maxImageSize  // ceil division
-        let numCols = (width + maxImageSize - 1) / maxImageSize
+        // Step 2: Calculate padded dimensions (round up to multiples of tileSize)
+        let paddedWidth = Int(ceil(fitSize.width / CGFloat(tileSize))) * tileSize
+        let paddedHeight = Int(ceil(fitSize.height / CGFloat(tileSize))) * tileSize
+
+        // Step 3: If already at multiples, no padding needed
+        if Int(fitSize.width) == paddedWidth && Int(fitSize.height) == paddedHeight {
+            return resizedImage
+        }
+
+        // Step 4: Create black background and center the image on it
+        let padX = (CGFloat(paddedWidth) - fitSize.width) / 2
+        let padY = (CGFloat(paddedHeight) - fitSize.height) / 2
+
+        // Create black background
+        let blackBackground = CIImage(color: .black).cropped(
+            to: CGRect(x: 0, y: 0, width: paddedWidth, height: paddedHeight)
+        )
+
+        // Center the resized image on the background
+        let centeredImage = resizedImage.transformed(
+            by: CGAffineTransform(translationX: padX, y: padY)
+        )
+
+        // Composite image over black background
+        return centeredImage.composited(over: blackBackground)
+    }
+
+    /// Split an image into tiles of maxImageSize, plus a global view.
+    /// Returns (tiles, numRows, numCols) where tiles includes all patches + global at the end.
+    /// Tiles are extracted in row-major order (top-to-bottom, left-to-right in visual space).
+    /// Aspect ratio is preserved exactly by padding with black instead of stretching.
+    private func splitImage(_ image: CIImage) -> ([CIImage], Int, Int) {
+        let tileSize = maxImageSize
+
+        // Resize and pad image so dimensions are exact multiples of tileSize
+        // This preserves aspect ratio and ensures clean tile boundaries
+        let paddedImage = resizeAndPadForTiling(image, longestEdge: longestEdge, tileSize: tileSize)
+
+        let width = Int(paddedImage.extent.width)
+        let height = Int(paddedImage.extent.height)
+
+        // Calculate number of tiles
+        let numCols = width / tileSize
+        let numRows = height / tileSize
 
         // If image fits in a single tile, no splitting needed
         if numRows == 1 && numCols == 1 {
-            // Just resize to maxImageSize and return as single image
-            let resized = MediaProcessing.resampleBicubic(
-                image, to: CGSize(width: maxImageSize, height: maxImageSize))
-            return ([resized], 0, 0)  // rows=0, cols=0 indicates single image
+            return ([paddedImage], 0, 0)  // rows=0, cols=0 indicates single image
         }
-
-        // Calculate optimal tile dimensions to evenly divide the image
-        let optimalHeight = (height + numRows - 1) / numRows
-        let optimalWidth = (width + numCols - 1) / numCols
 
         var tiles = [CIImage]()
 
-        // Extract tiles row by row
-        for row in 0..<numRows {
+        // Extract tiles in row-major order (top-to-bottom, left-to-right in visual space)
+        // CIImage has y=0 at bottom, so we iterate rows in reverse to get visual top-to-bottom order
+        for row in (0..<numRows).reversed() {
             for col in 0..<numCols {
-                let startX = col * optimalWidth
-                let startY = row * optimalHeight
-                let tileWidth = min(optimalWidth, width - startX)
-                let tileHeight = min(optimalHeight, height - startY)
+                let x = col * tileSize
+                let y = row * tileSize  // In CIImage coords, row 0 is at bottom
 
-                // CIImage origin is bottom-left, so flip Y coordinate
-                let flippedY = height - startY - tileHeight
                 let cropRect = CGRect(
-                    x: CGFloat(startX),
-                    y: CGFloat(flippedY),
-                    width: CGFloat(tileWidth),
-                    height: CGFloat(tileHeight)
+                    x: CGFloat(x),
+                    y: CGFloat(y),
+                    width: CGFloat(tileSize),
+                    height: CGFloat(tileSize)
                 )
 
-                var tile = image.cropped(to: cropRect)
+                var tile = paddedImage.cropped(to: cropRect)
                 // Reset origin to (0,0)
                 tile = tile.transformed(
                     by: CGAffineTransform(translationX: -tile.extent.origin.x, y: -tile.extent.origin.y))
-                // Resize tile to maxImageSize × maxImageSize
-                tile = MediaProcessing.resampleBicubic(
-                    tile, to: CGSize(width: maxImageSize, height: maxImageSize))
                 tiles.append(tile)
             }
         }
 
-        // Add global view (original resized to maxImageSize)
+        // Add global view (full padded image resized to tileSize × tileSize)
         let globalView = MediaProcessing.resampleBicubic(
-            image, to: CGSize(width: maxImageSize, height: maxImageSize))
+            paddedImage, to: CGSize(width: tileSize, height: tileSize))
         tiles.append(globalView)
 
         return (tiles, numRows, numCols)
@@ -1012,11 +1044,7 @@ public class Idefics3Processor: UserInputProcessor {
             image = MediaProcessing.inSRGBToneCurveSpace(image)
             image = MediaProcessing.apply(image, processing: input.processing)
 
-            // Step 3: Resize to fit within longestEdge while preserving aspect ratio
-            let fitSize = MediaProcessing.fitIn(image.extent.size, longestEdge: longestEdge)
-            image = MediaProcessing.resampleBicubic(image, to: fitSize)
-
-            // Step 4: Split image into tiles (or single image if small enough)
+            // Step 3: Split image into tiles (splitImage handles resize with proper alignment)
             let (tiles, numRows, numCols) = splitImage(image)
 
             // Step 5: Build the expanded image prompt string based on whether image was split
