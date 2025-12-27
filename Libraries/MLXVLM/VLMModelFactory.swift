@@ -65,8 +65,29 @@ private func create<C: Codable, P>(
         ) -> P
 ) -> (URL, any Tokenizer) throws -> P {
     { url, tokenizer in
-        let configuration = try JSONDecoder().decode(
-            C.self, from: Data(contentsOf: url))
+        // Read preprocessor_config.json
+        var configData = try Data(contentsOf: url)
+
+        // Also try to read processor_config.json and merge its values
+        // Some models (e.g., Granite Docling) split config between these two files
+        let processorConfigURL = url.deletingLastPathComponent().appending(
+            component: "processor_config.json")
+        if let processorData = try? Data(contentsOf: processorConfigURL),
+            var preprocessorDict = try? JSONSerialization.jsonObject(with: configData)
+                as? [String: Any],
+            let processorDict = try? JSONSerialization.jsonObject(with: processorData)
+                as? [String: Any]
+        {
+            // Merge processor_config into preprocessor_config (processor values take precedence)
+            for (key, value) in processorDict {
+                if preprocessorDict[key] == nil {
+                    preprocessorDict[key] = value
+                }
+            }
+            configData = try JSONSerialization.data(withJSONObject: preprocessorDict)
+        }
+
+        let configuration = try JSONDecoder().decode(C.self, from: configData)
         return processorInit(configuration, tokenizer)
     }
 }

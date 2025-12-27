@@ -787,7 +787,10 @@ public struct Idefics3ProcessorConfiguration: Codable, Sendable {
     public let imageMean: [CGFloat]
     public let imageStd: [CGFloat]
     public let size: Size
+    public let maxImageSize: Size?
     public let imageSequenceLength: Int?
+    public let imageTokenId: Int?
+    public let fakeImageTokenAroundImage: Int?
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
         (imageMean[0], imageMean[1], imageMean[2])
@@ -800,7 +803,35 @@ public struct Idefics3ProcessorConfiguration: Codable, Sendable {
         case imageMean = "image_mean"
         case imageStd = "image_std"
         case size
+        case maxImageSize = "max_image_size"
         case imageSequenceLength = "image_seq_len"
+        case imageTokenId = "image_token_id"
+        case fakeImageTokenAroundImage = "fake_image_token_around_image"
+    }
+}
+
+// MARK: - Message Generator
+
+public struct Idefics3MessageGenerator: MessageGenerator {
+    public init() {}
+
+    public func generate(message: Chat.Message) -> MLXLMCommon.Message {
+        // For Idefics3, images are represented as <image> in the content
+        // The actual image token expansion happens in the processor
+        var contentParts: [[String: Any]] = []
+
+        // Add image placeholders first
+        for _ in message.images {
+            contentParts.append(["type": "image"])
+        }
+
+        // Add text content
+        contentParts.append(["type": "text", "text": message.content])
+
+        return [
+            "role": message.role.rawValue,
+            "content": contentParts,
+        ]
     }
 }
 
@@ -809,11 +840,24 @@ public struct Idefics3ProcessorConfiguration: Codable, Sendable {
 public class Idefics3Processor: UserInputProcessor {
     private let config: Idefics3ProcessorConfiguration
     private let tokenizer: any Tokenizer
-    private let fixedImageSize = 384
+    private let maxImageSize: Int  // Size of each tile for vision encoder (e.g., 512)
+    private let longestEdge: Int   // Max size for initial resize (e.g., 2048)
+    private let imageTokenId: Int
+    private let fakeImageTokenAroundImage: Int?
+    private let globalImageTagId: Int?
+    private let imageSeqLen: Int
 
-    // From the Python code and default config, we know image_token_id is usually 49153.
-    // Hardcode this since we can't pass it in or rely on it from the processor config.
-    private let imageTokenId = 49153
+    // Token strings for building prompt
+    private let imageToken = "<image>"
+    private let fakeImageToken = "<fake_token_around_image>"
+    private let globalImageToken = "<global-img>"
+
+    /// Helper to look up a special token ID from the tokenizer
+    private static func lookupTokenId(tokenizer: any Tokenizer, token: String) -> Int? {
+        let encoded = tokenizer.encode(text: token)
+        // If encoding returns exactly one token, that's our ID
+        return encoded.count == 1 ? encoded[0] : nil
+    }
 
     public init(
         _ config: Idefics3ProcessorConfiguration,
@@ -821,25 +865,135 @@ public class Idefics3Processor: UserInputProcessor {
     ) {
         self.config = config
         self.tokenizer = tokenizer
+
+        // maxImageSize is the tile size for vision encoder (512 for Docling)
+        self.maxImageSize = config.maxImageSize?.longestEdge ?? 364
+        // longestEdge is the max size for initial resize (2048 for Docling)
+        self.longestEdge = config.size.longestEdge
+        // Image sequence length per tile (64 for Docling, 169 for standard)
+        self.imageSeqLen = config.imageSequenceLength ?? 169
+
+        // Look up special token IDs - try config first, then tokenizer, then defaults
+        self.imageTokenId = config.imageTokenId
+            ?? Self.lookupTokenId(tokenizer: tokenizer, token: "<image>")
+            ?? 49153  // Standard Idefics3 default
+
+        // fake_token_around_image for wrapping image sequences
+        self.fakeImageTokenAroundImage = config.fakeImageTokenAroundImage
+            ?? Self.lookupTokenId(tokenizer: tokenizer, token: "<fake_token_around_image>")
+
+        // <global-img> token for marking global image region
+        self.globalImageTagId = Self.lookupTokenId(tokenizer: tokenizer, token: "<global-img>")
     }
 
-    private func prompt(from userInput: UserInput) -> String {
-        switch userInput.prompt {
-        case .text(let text):
-            text
-        case .messages(let messages):
-            messages.last?["content"] as? String ?? ""
-        case .chat(let messages):
-            messages.last?.content ?? ""
+    /// Split an image into tiles of maxImageSize, plus a global view
+    /// Returns (tiles, numRows, numCols) where tiles includes all patches + global at the end
+    private func splitImage(_ image: CIImage) -> ([CIImage], Int, Int) {
+        let width = Int(image.extent.width)
+        let height = Int(image.extent.height)
+
+        // Calculate number of splits needed
+        let numRows = (height + maxImageSize - 1) / maxImageSize  // ceil division
+        let numCols = (width + maxImageSize - 1) / maxImageSize
+
+        // If image fits in a single tile, no splitting needed
+        if numRows == 1 && numCols == 1 {
+            // Just resize to maxImageSize and return as single image
+            let resized = MediaProcessing.resampleBicubic(
+                image, to: CGSize(width: maxImageSize, height: maxImageSize))
+            return ([resized], 0, 0)  // rows=0, cols=0 indicates single image
         }
+
+        // Calculate optimal tile dimensions to evenly divide the image
+        let optimalHeight = (height + numRows - 1) / numRows
+        let optimalWidth = (width + numCols - 1) / numCols
+
+        var tiles = [CIImage]()
+
+        // Extract tiles row by row
+        for row in 0..<numRows {
+            for col in 0..<numCols {
+                let startX = col * optimalWidth
+                let startY = row * optimalHeight
+                let tileWidth = min(optimalWidth, width - startX)
+                let tileHeight = min(optimalHeight, height - startY)
+
+                // CIImage origin is bottom-left, so flip Y coordinate
+                let flippedY = height - startY - tileHeight
+                let cropRect = CGRect(
+                    x: CGFloat(startX),
+                    y: CGFloat(flippedY),
+                    width: CGFloat(tileWidth),
+                    height: CGFloat(tileHeight)
+                )
+
+                var tile = image.cropped(to: cropRect)
+                // Reset origin to (0,0)
+                tile = tile.transformed(
+                    by: CGAffineTransform(translationX: -tile.extent.origin.x, y: -tile.extent.origin.y))
+                // Resize tile to maxImageSize × maxImageSize
+                tile = MediaProcessing.resampleBicubic(
+                    tile, to: CGSize(width: maxImageSize, height: maxImageSize))
+                tiles.append(tile)
+            }
+        }
+
+        // Add global view (original resized to maxImageSize)
+        let globalView = MediaProcessing.resampleBicubic(
+            image, to: CGSize(width: maxImageSize, height: maxImageSize))
+        tiles.append(globalView)
+
+        return (tiles, numRows, numCols)
+    }
+
+    /// Build image prompt STRING for split images (to replace <image> placeholder)
+    /// Format: <fake><row_1_col_1><image>×N ... \n ... <fake><global-img><image>×N<fake>
+    private func buildSplitImagePromptString(numRows: Int, numCols: Int) -> String {
+        var result = ""
+        let imageTokens = String(repeating: imageToken, count: imageSeqLen)
+
+        // Add tokens for each tile with row/col markers
+        for row in 1...numRows {
+            for col in 1...numCols {
+                result += fakeImageToken
+                result += "<row_\(row)_col_\(col)>"
+                result += imageTokens
+            }
+            // Add newline after each row
+            result += "\n"
+        }
+
+        // Add extra newline before global image
+        result += "\n"
+
+        // Add global image tokens
+        result += fakeImageToken
+        result += globalImageToken
+        result += imageTokens
+        result += fakeImageToken
+
+        return result
+    }
+
+    /// Build image prompt STRING for single (non-split) images
+    /// Format: <fake><global-img><image>×N<fake>
+    private func buildSingleImagePromptString() -> String {
+        var result = ""
+        result += fakeImageToken
+        result += globalImageToken
+        result += String(repeating: imageToken, count: imageSeqLen)
+        result += fakeImageToken
+        return result
     }
 
     public func prepare(input: UserInput) throws -> LMInput {
-        let prompt = prompt(from: input)
+        // Generate messages using the message generator (handles proper structure with image placeholders)
+        let messages = Idefics3MessageGenerator().generate(from: input)
+
         if input.images.isEmpty {
-            // No image scenario
-            let tokens = tokenizer.encode(text: prompt)
-            let tokensArray = MLXArray(tokens).expandedDimensions(axis: 0)
+            // No image scenario - just apply chat template
+            let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+            let tokensArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: tokensArray)
             return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
         } else {
@@ -848,52 +1002,66 @@ public class Idefics3Processor: UserInputProcessor {
                 throw VLMError.singleImageAllowed
             }
 
-            // Encode only the text part of the prompt, without <image>
-            var promptTokens = tokenizer.encode(text: prompt)
+            // Step 1: Apply chat template to get formatted prompt with role markers
+            // The chat template will include a single <image> placeholder that we'll expand
+            let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+            let decodedPrompt = tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
 
-            let imageTokenIndex = promptTokens.count / 2
-            promptTokens.insert(imageTokenId, at: imageTokenIndex)
-
-            let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
-            let mask = ones(like: promptArray)
-
+            // Step 2: Load and preprocess image
             var image = try input.images[0].asCIImage()
             image = MediaProcessing.inSRGBToneCurveSpace(image)
-            let targetSize = CGSize(
-                width: fixedImageSize,
-                height: fixedImageSize
-            )
             image = MediaProcessing.apply(image, processing: input.processing)
-            image = MediaProcessing.resampleBicubic(image, to: targetSize)
-            image = MediaProcessing.normalize(
-                image,
-                mean: config.imageMeanTuple,
-                std: config.imageStdTuple
-            )
-            var pixels = MediaProcessing.asMLXArray(image)
 
-            if pixels.ndim == 2 {
-                pixels = pixels.expandedDimensions(axis: -1)
+            // Step 3: Resize to fit within longestEdge while preserving aspect ratio
+            let fitSize = MediaProcessing.fitIn(image.extent.size, longestEdge: longestEdge)
+            image = MediaProcessing.resampleBicubic(image, to: fitSize)
+
+            // Step 4: Split image into tiles (or single image if small enough)
+            let (tiles, numRows, numCols) = splitImage(image)
+
+            // Step 5: Build the expanded image prompt string based on whether image was split
+            let imagePromptString: String
+            if numRows == 0 && numCols == 0 {
+                // Single image (no splitting)
+                imagePromptString = buildSingleImagePromptString()
+            } else {
+                // Split image with row/col markers
+                imagePromptString = buildSplitImagePromptString(numRows: numRows, numCols: numCols)
             }
 
-            if pixels.ndim == 3 {
-                pixels = pixels.expandedDimensions(axis: 0)
+            // Step 6: Replace <image> placeholder with expanded image tokens
+            let expandedPrompt = decodedPrompt.replacingOccurrences(
+                of: imageToken, with: imagePromptString)
+
+            // Step 7: Re-encode the expanded prompt
+            let finalTokens = tokenizer.encode(text: expandedPrompt)
+            let promptArray = MLXArray(finalTokens).expandedDimensions(axis: 0)
+            let mask = ones(like: promptArray)
+
+            // Step 8: Process all tiles into pixel arrays
+            var pixelArrays = [MLXArray]()
+            for tile in tiles {
+                // Normalize each tile
+                let normalizedTile = MediaProcessing.normalize(
+                    tile,
+                    mean: config.imageMeanTuple,
+                    std: config.imageStdTuple
+                )
+                var pixels = MediaProcessing.asMLXArray(normalizedTile)
+
+                // asMLXArray returns [1, C, H, W], we need [H, W, C] for stacking
+                // First squeeze the batch dimension, then transpose
+                pixels = pixels.squeezed(axis: 0)  // [C, H, W]
+                pixels = pixels.transposed(1, 2, 0)  // [H, W, C]
+                pixelArrays.append(pixels)
             }
 
-            // If shape is (B,C,H,W), transpose to (B,H,W,C)
-            if pixels
-                .dim(1) == 3
-                && pixels
-                    .dim(2) == fixedImageSize
-                && pixels
-                    .dim(3) == fixedImageSize
-            {
-                pixels = pixels.transposed(0, 2, 3, 1)
-            }
+            // Stack all tiles into [numTiles, H, W, C]
+            let stackedPixels = MLX.stacked(pixelArrays, axis: 0)
 
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask),
-                image: .init(pixels: pixels)
+                image: .init(pixels: stackedPixels)
             )
         }
     }
